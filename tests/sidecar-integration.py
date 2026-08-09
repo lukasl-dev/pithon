@@ -14,7 +14,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-SIDECAR = ROOT / "ipython" / "sidecar.py"
+SIDECAR = ROOT / "sidecar.py"
 PYTHON = os.environ.get("PI_IPYTHON_PYTHON", sys.executable)
 
 

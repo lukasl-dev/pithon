@@ -4,11 +4,11 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PiIPythonClient } from "../ipython/kernel-client.ts";
+import { PiIPythonClient } from "../kernel-client.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const python = process.env.PI_IPYTHON_PYTHON ?? "python3";
-const sidecar = join(root, "ipython", "sidecar.py");
+const sidecar = join(root, "sidecar.py");
 const cwd = mkdtempSync(join(tmpdir(), "pi-ipython-client-test-"));
 const snapshot = join(cwd, "state.dill");
 const notebook = join(cwd, "notebook.ipynb");

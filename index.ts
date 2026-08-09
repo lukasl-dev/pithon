@@ -14,15 +14,18 @@ import {
   resolveKernelPython,
   resolveSidecarPath,
 } from "./kernel-client.ts";
+import {
+  applyEnvironmentOverrides,
+  type IPythonConfig,
+  readIPythonConfig,
+  writeIPythonConfig,
+} from "./config.ts";
+import { openIPythonSettings } from "./settings.ts";
 
 const SNAPSHOT_DEBOUNCE_MS = 1500;
 const FINALIZE_TIMEOUT_MS = 8000;
 
-/**
- * Notebook-first mode deliberately removes Pi's separate file and shell tools.
- * They remain available behind PI_IPYTHON_KEEP_BUILTINS=1 for comparison and
- * recovery, while tools provided by other extensions remain untouched.
- */
+/** Pi's native file/shell tools; tools from other extensions stay untouched. */
 const BUILTIN_TOOL_NAMES = new Set([
   "read",
   "bash",
@@ -81,6 +84,22 @@ const state: KernelState = {
   snapshotInFlight: false,
   snapshotDirty: false,
 };
+let config = applyEnvironmentOverrides(readIPythonConfig());
+
+function syncToolSelection(pi: ExtensionAPI, next: IPythonConfig): void {
+  const available = new Set(pi.getAllTools().map(({ name }) => name));
+  const active = new Set(pi.getActiveTools());
+
+  if (next.enabled) active.add("ipython");
+  else active.delete("ipython");
+
+  for (const name of BUILTIN_TOOL_NAMES) {
+    if (!available.has(name)) continue;
+    if (next.enabled && next.disableBuiltins) active.delete(name);
+    else active.add(name);
+  }
+  pi.setActiveTools([...active]);
+}
 
 function resetState(): void {
   if (state.snapshotTimer) clearTimeout(state.snapshotTimer);
@@ -125,6 +144,7 @@ async function ensureClient(
 
 /** Debounced dill snapshot after each settled user cell. */
 function scheduleSnapshot(): void {
+  if (!config.snapshotState) return;
   state.snapshotDirty = true;
   if (!state.client || !state.snapshotPath || state.snapshotInFlight) return;
   if (state.snapshotTimer) clearTimeout(state.snapshotTimer);
@@ -165,6 +185,10 @@ function appendOutput(current: string, next: string): string {
 async function maybeRestore(
   ctx: ExtensionContext,
 ): Promise<string | undefined> {
+  if (!config.restoreState) {
+    state.restoreDone = true;
+    return undefined;
+  }
   if (state.restoreDone || !state.client || !state.snapshotPath)
     return undefined;
   state.restoreDone = true;
@@ -203,7 +227,28 @@ function chooseBusyAction(
 }
 
 export default function (pi: ExtensionAPI) {
+  function saveAndApplyConfig(
+    ctx: ExtensionContext,
+    next: IPythonConfig,
+  ): IPythonConfig | undefined {
+    const saved = writeIPythonConfig(next);
+    if (!saved.ok) {
+      ctx.ui.notify(`Failed to save IPython settings: ${saved.error}`, "error");
+      return undefined;
+    }
+
+    config = applyEnvironmentOverrides(next);
+    if (!config.snapshotState) {
+      if (state.snapshotTimer) clearTimeout(state.snapshotTimer);
+      state.snapshotTimer = undefined;
+      state.snapshotDirty = false;
+    }
+    syncToolSelection(pi, config);
+    return config;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    config = applyEnvironmentOverrides(readIPythonConfig());
     resetState();
     state.cwd = ctx.cwd;
     const sessionDir = ctx.sessionManager.getSessionDir();
@@ -212,15 +257,7 @@ export default function (pi: ExtensionAPI) {
     state.snapshotPath = join(state.stateDir, "kernel-state.dill");
     state.notebookPath = join(state.stateDir, "kernel-notebook.ipynb");
 
-    if (process.env.PI_IPYTHON_KEEP_BUILTINS !== "1") {
-      const activeTools = pi.getActiveTools();
-      const notebookTools = activeTools.filter(
-        (name) => !BUILTIN_TOOL_NAMES.has(name),
-      );
-      if (notebookTools.length !== activeTools.length) {
-        pi.setActiveTools(notebookTools);
-      }
-    }
+    syncToolSelection(pi, config);
   });
 
   pi.on("session_shutdown", async () => {
@@ -232,10 +269,9 @@ export default function (pi: ExtensionAPI) {
     const client = state.client;
     state.client = undefined;
     if (!client) return;
-    const exportIpynb = (process.env.PI_IPYTHON_EXPORT_IPYNB ?? "1") !== "0";
     const work = client.finalize(
-      state.snapshotPath,
-      exportIpynb ? state.notebookPath : undefined,
+      config.snapshotState ? state.snapshotPath : undefined,
+      config.exportNotebook ? state.notebookPath : undefined,
     );
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -296,7 +332,11 @@ export default function (pi: ExtensionAPI) {
         0,
         0,
       );
-      if (!options.expanded) return renderedOutput;
+      if (!options.expanded) {
+        return config.showOutputWhenCollapsed
+          ? renderedOutput
+          : new Container();
+      }
 
       const expanded = new Container();
       expanded.addChild(new Spacer(1));
@@ -309,6 +349,7 @@ export default function (pi: ExtensionAPI) {
     },
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (!config.enabled) throw new Error("pi-ipython is disabled");
       const working = (message?: string) => {
         try {
           ctx.ui.setWorkingMessage(message);
@@ -337,6 +378,7 @@ export default function (pi: ExtensionAPI) {
           try {
             result = await client.execute(params.code, {
               signal,
+              maxOutputChars: config.maxOutputChars,
               onStream: (text, name) => {
                 onUpdate?.({
                   content: [{ type: "text", text }],
@@ -417,7 +459,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
+    if (!config.enabled) return;
     return { systemPrompt: event.systemPrompt + IPYTHON_DOCTRINE };
+  });
+
+  pi.registerCommand("pithon", {
+    description: "Configure the IPython extension",
+    handler: async (_args, ctx) => {
+      config = applyEnvironmentOverrides(readIPythonConfig());
+      syncToolSelection(pi, config);
+      await openIPythonSettings(ctx, config, (next) =>
+        saveAndApplyConfig(ctx, next),
+      );
+    },
   });
 
   pi.registerCommand("kernel", {

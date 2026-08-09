@@ -4,18 +4,18 @@
 
 set -euo pipefail
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-source_dir="$root/ipython"
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 target_dir="$HOME/.pi/agent/extensions/pi-ipython"
+runtime_files=(index.ts kernel-client.ts sidecar.py config.ts settings.ts README.md)
 
-test -f "$source_dir/index.ts"
-test -f "$source_dir/kernel-client.ts"
-test -f "$source_dir/sidecar.py"
+for file in "${runtime_files[@]}"; do
+  test -f "$source_dir/$file"
+done
 
 rm -rf -- "$target_dir"
 mkdir -p -- "$target_dir"
-cp -a -- "$source_dir/." "$target_dir/"
-rm -rf -- "$target_dir/__pycache__"
-find "$target_dir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+for file in "${runtime_files[@]}"; do
+  cp -a -- "$source_dir/$file" "$target_dir/$file"
+done
 
 printf 'Installed test extension: %s -> %s\n' "$source_dir" "$target_dir"
