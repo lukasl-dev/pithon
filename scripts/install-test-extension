@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Install the repository source as Pi's global test extension. The source of
+# truth remains this repository; ~/.pi is intentionally a replaceable copy.
+
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+source_dir="$root/ipython"
+target_dir="$HOME/.pi/agent/extensions/pi-ipython"
+
+test -f "$source_dir/index.ts"
+test -f "$source_dir/kernel-client.ts"
+test -f "$source_dir/sidecar.py"
+
+rm -rf -- "$target_dir"
+mkdir -p -- "$target_dir"
+cp -a -- "$source_dir/." "$target_dir/"
+rm -rf -- "$target_dir/__pycache__"
+find "$target_dir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+printf 'Installed test extension: %s -> %s\n' "$source_dir" "$target_dir"

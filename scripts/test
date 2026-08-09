@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd -- "$root"
+
+python3 -m py_compile ipython/sidecar.py
+python3 tests/sidecar-integration.py
+node --experimental-transform-types --disable-warning=ExperimentalWarning \
+  tests/kernel-client-integration.ts
