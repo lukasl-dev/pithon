@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
-"""pi-ipython sidecar: owns one persistent IPython kernel via jupyter_client.
-
-Speaks JSON-lines over stdio:
-
-  request:  {"id": N, "method": "...", "params": {...}}
-  response: {"id": N, "ok": true,  "result": {...}}
-            {"id": N, "ok": false, "error": {"code": "...", "message": "..."}}
-  event:    {"id": N, "event": "stream", "name": "stdout"|"stderr", "text": "..."}
-
-Methods:
-  ping              - liveness check
-  start {cwd}       - spawn the kernel in `cwd` and run the bootstrap cell
-  execute {code, timeout_ms, max_output_chars, record}
-                    - run one cell; emits `stream` events, returns the final state
-  interrupt         - interrupt the running cell via the control channel; handled
-                      on the main thread so it can preempt an in-flight execute
-  restart           - hard-restart the kernel (fresh namespace, keeps notebook cells)
-  snapshot {path}   - dill-serialize the user namespace to `path` (per-variable)
-  restore {path}    - revive a namespace written by `snapshot`
-  export_ipynb {path} - write the recorded cells+outputs as an .ipynb
-  shutdown          - stop the kernel and exit
-
-Concurrency: the stdin loop runs on the main thread; kernel-bound requests
-(start, execute, snapshot, restore, restart, export, shutdown) are serialized
-on a worker thread. `interrupt` is the exception - it runs on the main thread
-so it can preempt a cell that is stuck, matching the control-channel semantics
-of the Jupyter protocol.
-"""
+"""Run an IPython kernel behind a small JSON-lines protocol."""
 
 from __future__ import annotations
 
@@ -39,57 +12,52 @@ import sys
 import tempfile
 import threading
 import time
-
+from contextlib import suppress
+from dataclasses import dataclass, field
 from queue import Empty
+from textwrap import dedent
+from typing import Callable
 
-ACQUIRE_TIMEOUT_S = (
-    5.0  # how long a queued request waits before we report "kernel busy"
-)
-BUSY_AFTER_INTERRUPT_S = (
-    5.0  # how long an interrupted cell may run before we declare it stuck
-)
-IOPUB_POLL_S = 0.2
-DEFAULT_MAX_OUTPUT_CHARS = 65536
-DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
+ACQUIRE_TIMEOUT = 5.0
+INTERRUPT_TIMEOUT = 5.0
+POLL_INTERVAL = 0.2
+DEFAULT_OUTPUT_LIMIT = 64 * 1024
+SNAPSHOT_LIMIT = 256 * 1024 * 1024
 RESULT_MARKER = "__PI_IPYTHON_STATE__"
 
+BOOTSTRAP_CELL = dedent(
+    """
+    import os as _pi_ipython_os
 
-BOOTSTRAP_CELL = """
-import os as _pi_ipython_os
-_pi_ipython_os.environ["NO_COLOR"] = "1"
-try:
-    get_ipython().run_line_magic("colors", "nocolor")
-except Exception:
+    _pi_ipython_os.environ["NO_COLOR"] = "1"
     try:
-        get_ipython().colors = "nocolor"
+        get_ipython().run_line_magic("colors", "nocolor")
+    except Exception:
+        try:
+            get_ipython().colors = "nocolor"
+        except Exception:
+            pass
+
+    try:
+        import nest_asyncio as _pi_ipython_nest_asyncio
+        _pi_ipython_nest_asyncio.apply()
     except Exception:
         pass
-try:
-    import nest_asyncio as _pi_ipython_nest_asyncio
-    _pi_ipython_nest_asyncio.apply()
-except Exception:
-    pass
-"""
+    """
+).strip()
 
 
 class KernelBusyError(Exception):
-    """The kernel is still executing a previous cell (typically one that
-    ignored an interrupt) and will not pick up new requests."""
+    pass
 
 
 class UsageError(Exception):
-    """A request was made that the current sidecar state cannot serve."""
+    pass
 
 
-# ---- snapshot / restore cell sources ------------------------------------
-#
-# Both cells print exactly one RESULT_MARKER line carrying a JSON payload; the
-# host parses that line out of the cell output. All builtins are reached through
-# the `_b` alias so the helpers keep working even when the user namespace has
-# shadowed names like list/open/print/len.
-
-
-def build_snapshot_cell(path: str, max_bytes: int) -> str:
+def snapshot_cell(path: str, max_bytes: int) -> str:
+    # This code runs inside the user's kernel. Builtins go through `_b` because
+    # names such as `open` and `list` may have been reassigned by the user.
     return (
         f"""
 def _pi_ipython_snapshot_state():
@@ -99,50 +67,55 @@ def _pi_ipython_snapshot_state():
     except _b.Exception as _err:
         _b.print({RESULT_MARKER!r} + json.dumps({{"error": "dill unavailable: " + _b.str(_err)}}))
         return
+
     dill.settings["recurse"] = True
-    ip = None
     try:
-        ip = get_ipython()  # noqa: F821 (injected by IPython)
+        ip = get_ipython()  # noqa: F821
     except _b.Exception:
         ip = None
-    ns = ip.user_ns if ip is not None else _b.globals()
+    namespace = ip.user_ns if ip is not None else _b.globals()
     hidden = _b.set(_b.getattr(ip, "user_ns_hidden", {{}}) or {{}}) if ip is not None else _b.set()
-    # Live/injected handles that the bootstrap recreates or that make no sense
-    # to revive; user shadows of builtins (e.g. a variable named "list") are kept.
     always_skip = _b.set(["In", "Out", "get_ipython", "exit", "quit", "open"])
-    payload = {{}}
+
+    values = {{}}
     skipped = []
     total = 0
-    for name in _b.list(ns.keys()):
+    for name in _b.list(namespace):
         if name.startswith("_") or name in hidden or name in always_skip:
             continue
-        value = ns[name]
         try:
-            blob = dill.dumps(value)
+            blob = dill.dumps(namespace[name])
         except _b.Exception as _err:
             skipped.append({{"name": name, "reason": _b.type(_err).__name__ + ": " + _b.str(_err)[:200]}})
             continue
         if _b.len(blob) > {max_bytes} or total + _b.len(blob) > {max_bytes}:
             skipped.append({{"name": name, "reason": "exceeds snapshot size cap"}})
             continue
-        payload[name] = blob
+        values[name] = blob
         total += _b.len(blob)
+
     directory = os.path.dirname({path!r})
     if directory:
         os.makedirs(directory, exist_ok=True)
-    tmp = {path!r} + ".tmp"
+    temporary = {path!r} + ".tmp"
     try:
-        with _b.open(tmp, "wb") as fh:
-            dill.dump(payload, fh)
-        os.replace(tmp, {path!r})
+        with _b.open(temporary, "wb") as file:
+            dill.dump(values, file)
+        os.replace(temporary, {path!r})
     except _b.Exception as _err:
         try:
-            os.remove(tmp)
+            os.remove(temporary)
         except _b.Exception:
             pass
         _b.print({RESULT_MARKER!r} + json.dumps({{"error": "write failed: " + _b.str(_err)}}))
         return
-    _b.print({RESULT_MARKER!r} + json.dumps({{"saved": _b.sorted(payload.keys()), "skipped": skipped, "bytes": os.path.getsize({path!r})}}))
+
+    result = {{
+        "saved": _b.sorted(values),
+        "skipped": skipped,
+        "bytes": os.path.getsize({path!r}),
+    }}
+    _b.print({RESULT_MARKER!r} + json.dumps(result))
 
 _pi_ipython_snapshot_state()
 """.strip()
@@ -150,31 +123,33 @@ _pi_ipython_snapshot_state()
     )
 
 
-def build_restore_cell(path: str) -> str:
+def restore_cell(path: str) -> str:
     return (
         f"""
 def _pi_ipython_restore_state():
     import builtins as _b, json
-    restored, failed = [], []
     try:
         import dill
-        with _b.open({path!r}, "rb") as fh:
-            payload = dill.load(fh)
+        with _b.open({path!r}, "rb") as file:
+            values = dill.load(file)
     except _b.Exception as _err:
         _b.print({RESULT_MARKER!r} + json.dumps({{"error": _b.str(_err)}}))
         return
-    ip = None
+
     try:
         ip = get_ipython()  # noqa: F821
     except _b.Exception:
         ip = None
-    ns = ip.user_ns if ip is not None else _b.globals()
-    for name, blob in payload.items():
+    namespace = ip.user_ns if ip is not None else _b.globals()
+    restored = []
+    failed = []
+    for name, blob in values.items():
         try:
-            ns[name] = dill.loads(blob)
+            namespace[name] = dill.loads(blob)
             restored.append(name)
         except _b.Exception as _err:
             failed.append({{"name": name, "reason": _b.type(_err).__name__ + ": " + _b.str(_err)[:200]}})
+
     _b.print({RESULT_MARKER!r} + json.dumps({{"restored": restored, "failed": failed}}))
 
 _pi_ipython_restore_state()
@@ -183,19 +158,16 @@ _pi_ipython_restore_state()
     )
 
 
-def _cap(buf: str, text: str, cap: int) -> tuple[str, bool]:
-    """Append `text` to `buf`, never exceeding `cap` chars. Returns (buf, truncated)."""
-    if cap <= 0:
-        return buf + text, False
-    room = cap - len(buf)
-    if room <= 0:
-        return buf, True
-    if len(text) > room:
-        return buf + text[:room], True
-    return buf + text, False
+def append_limited(current: str, text: str, limit: int) -> tuple[str, bool]:
+    if limit <= 0:
+        return current + text, False
+    remaining = limit - len(current)
+    if remaining <= 0:
+        return current, True
+    return current + text[:remaining], len(text) > remaining
 
 
-def _empty_execution_result(status: str, cells: int) -> dict:
+def empty_result(status: str, cells: int) -> dict:
     return {
         "status": status,
         "stdout": "",
@@ -207,50 +179,114 @@ def _empty_execution_result(status: str, cells: int) -> dict:
     }
 
 
+@dataclass
+class OutputCapture:
+    limit: int
+    stdout: str = ""
+    stderr: str = ""
+    result: str = ""
+    truncated: dict[str, bool] = field(
+        default_factory=lambda: {"stdout": False, "stderr": False, "result": False}
+    )
+    notebook_outputs: list[dict] = field(default_factory=list)
+    _notebook_chars: int = 0
+    _notebook_truncated: bool = False
+
+    def _append(self, name: str, text: str) -> str:
+        current = getattr(self, name)
+        updated, truncated = append_limited(current, text, self.limit)
+        setattr(self, name, updated)
+        self.truncated[name] |= truncated
+        return updated[len(current) :]
+
+    def _record(self, output: dict) -> None:
+        size = len(json.dumps(output, ensure_ascii=False))
+        if self.limit <= 0 or self._notebook_chars + size <= self.limit:
+            self.notebook_outputs.append(output)
+            self._notebook_chars += size
+        elif not self._notebook_truncated:
+            self.notebook_outputs.append(
+                {
+                    "output_type": "stream",
+                    "name": "stderr",
+                    "text": ["[notebook output truncated]\n"],
+                }
+            )
+            self._notebook_truncated = True
+
+    def stream(self, name: str, text: str) -> str:
+        name = "stderr" if name == "stderr" else "stdout"
+        accepted = self._append(name, text)
+        if accepted:
+            self._record({"output_type": "stream", "name": name, "text": [accepted]})
+        return accepted
+
+    def execution_result(self, text: str, count: int) -> None:
+        accepted = self._append("result", text)
+        if accepted:
+            self._record(
+                {
+                    "output_type": "execute_result",
+                    "execution_count": count,
+                    "data": {"text/plain": [accepted]},
+                    "metadata": {},
+                }
+            )
+
+    def display(self, data: dict, metadata: dict) -> None:
+        data = dict(data)
+        if "text/plain" in data:
+            data["text/plain"] = self._append("result", data["text/plain"])
+        self._record(
+            {"output_type": "display_data", "data": data, "metadata": metadata}
+        )
+
+    def error(self, content: dict) -> dict:
+        error = {
+            "ename": content.get("ename", ""),
+            "evalue": content.get("evalue", ""),
+            "traceback": content.get("traceback", []),
+        }
+        self._record({"output_type": "error", **error})
+        return error
+
+
 class KernelSession:
-    """One kernel plus the notebook cells recorded for it. All kernel access is
-    serialized on the worker thread, except interrupt() which may be called from
-    the main thread while a cell is running."""
+    """The live kernel and the notebook cells recorded from it."""
 
     def __init__(self, cwd: str) -> None:
         self.cwd = cwd
-        self.km = None
-        self.kc = None
+        self.manager = None
+        self.client = None
         self.started = False
         self.cells: list[dict] = []
         self.execution_count = 0
         self._interrupt_requested = threading.Event()
-        self._unsettled_msg_id: str | None = None
-        self._ipc_dir: tempfile.TemporaryDirectory[str] | None = None
-        self._lock = threading.Lock()
-
-    # -- lifecycle ---------------------------------------------------------
+        self._unfinished_message: str | None = None
+        self._ipc_directory: tempfile.TemporaryDirectory[str] | None = None
+        self._kernel_lock = threading.Lock()
 
     def start(self) -> None:
         from jupyter_client import KernelManager
 
         try:
-            with self._lock:
+            with self._kernel_lock:
                 self._interrupt_requested.clear()
-                self._ipc_dir = tempfile.TemporaryDirectory(prefix="pi-ipython-")
-                self.km = KernelManager(
+                self._ipc_directory = tempfile.TemporaryDirectory(prefix="pi-ipython-")
+                self.manager = KernelManager(
                     kernel_name="python3",
                     cwd=self.cwd,
                     interrupt_mode="message",
                     transport="ipc",
-                    ip=os.path.join(self._ipc_dir.name, "kernel"),
+                    ip=os.path.join(self._ipc_directory.name, "kernel"),
                 )
-                # Cell output arrives over IOPub. Kernel process logging is not
-                # user output and would otherwise leak into the sidecar stderr.
-                self.km.start_kernel(
+                self.manager.start_kernel(
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                self.kc = self.km.client()
-                self.kc.start_channels()
-                self.kc.wait_for_ready(timeout=60)
-            # Set before the bootstrap so the bootstrap cell itself passes the
-            # started guard in execute().
+                self.client = self.manager.client()
+                self.client.start_channels()
+                self.client.wait_for_ready(timeout=60)
             self.started = True
             self._run_internal(BOOTSTRAP_CELL)
         except Exception:
@@ -258,28 +294,21 @@ class KernelSession:
             raise
 
     def _teardown(self) -> None:
-        """Stop channels and shut down the kernel; never raises."""
         self.started = False
-        self._unsettled_msg_id = None
-        with self._lock:
-            if self.kc is not None:
-                try:
-                    self.kc.stop_channels()
-                except Exception:
-                    pass
-                self.kc = None
-            if self.km is not None:
-                try:
-                    self.km.shutdown_kernel(now=True)
-                except Exception:
-                    pass
-                self.km = None
-            if self._ipc_dir is not None:
-                try:
-                    self._ipc_dir.cleanup()
-                except Exception:
-                    pass
-                self._ipc_dir = None
+        self._unfinished_message = None
+        with self._kernel_lock:
+            if self.client is not None:
+                with suppress(Exception):
+                    self.client.stop_channels()
+                self.client = None
+            if self.manager is not None:
+                with suppress(Exception):
+                    self.manager.shutdown_kernel(now=True)
+                self.manager = None
+            if self._ipc_directory is not None:
+                with suppress(Exception):
+                    self._ipc_directory.cleanup()
+                self._ipc_directory = None
 
     def restart(self) -> dict:
         self._teardown()
@@ -289,21 +318,16 @@ class KernelSession:
     def shutdown(self) -> None:
         self._teardown()
 
-    # -- interrupt (main thread; preempts a running cell) ------------------
-
     def _interrupt_kernel(self) -> None:
-        """Interrupt the running cell, falling back to SIGINT; never raises."""
-        with self._lock:
-            km = self.km
-        if km is None:
+        with self._kernel_lock:
+            manager = self.manager
+        if manager is None:
             return
         try:
-            km.interrupt_kernel()
+            manager.interrupt_kernel()
         except Exception:
-            try:
-                km.signal_kernel(signal.SIGINT)
-            except Exception:
-                pass
+            with suppress(Exception):
+                manager.signal_kernel(signal.SIGINT)
 
     def interrupt(self) -> dict:
         self._interrupt_requested.set()
@@ -311,199 +335,148 @@ class KernelSession:
         return {"interrupted": True}
 
     def prepare_execute(self) -> None:
-        """Clear cancellation before a request becomes the active execution."""
         self._interrupt_requested.clear()
 
-    def _wait_for_unsettled_cell(self) -> None:
-        """Wait briefly for a previously interrupted cell without queueing code."""
-        if self._unsettled_msg_id is None or self.kc is None or self.km is None:
+    def _finish_interrupted_cell(self) -> None:
+        """Drain an earlier cell until it becomes idle, without submitting code."""
+        if (
+            self._unfinished_message is None
+            or self.client is None
+            or self.manager is None
+        ):
             return
-        deadline = time.monotonic() + ACQUIRE_TIMEOUT_S
+
+        deadline = time.monotonic() + ACQUIRE_TIMEOUT
         interrupt_sent = False
         while time.monotonic() < deadline:
             if self._interrupt_requested.is_set() and not interrupt_sent:
                 self._interrupt_kernel()
                 interrupt_sent = True
             try:
-                msg = self.kc.get_iopub_msg(timeout=IOPUB_POLL_S)
+                message = self.client.get_iopub_msg(timeout=POLL_INTERVAL)
             except Empty:
-                if not self.km.is_alive():
+                if not self.manager.is_alive():
                     raise RuntimeError("IPython kernel exited during execution")
                 continue
-            if msg.get("parent_header", {}).get("msg_id") != self._unsettled_msg_id:
+            if not self._belongs_to(message, self._unfinished_message):
                 continue
-            if (
-                msg.get("msg_type") == "status"
-                and msg.get("content", {}).get("execution_state") == "idle"
-            ):
-                self._unsettled_msg_id = None
+            if self._is_idle(message):
+                self._unfinished_message = None
                 return
+
         raise KernelBusyError(
             "the interrupted IPython cell is still running; wait and retry, "
             "or restart the kernel to start fresh"
         )
 
-    # -- execute ------------------------------------------------------------
+    @staticmethod
+    def _belongs_to(message: dict, message_id: str) -> bool:
+        return message.get("parent_header", {}).get("msg_id") == message_id
+
+    @staticmethod
+    def _is_idle(message: dict) -> bool:
+        return (
+            message.get("msg_type") == "status"
+            and message.get("content", {}).get("execution_state") == "idle"
+        )
 
     def execute(
         self,
         code: str,
         timeout_ms: int = 0,
-        max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+        max_output_chars: int = DEFAULT_OUTPUT_LIMIT,
         record: bool = True,
-        emit=None,
+        emit: Callable[[dict], None] | None = None,
         prepared: bool = False,
     ) -> dict:
-        if not self.started or self.km is None or self.kc is None:
+        if not self.started or self.manager is None or self.client is None:
             raise UsageError("kernel not started")
         if not prepared:
             self.prepare_execute()
-        self._wait_for_unsettled_cell()
+
+        self._finish_interrupted_cell()
         if self._interrupt_requested.is_set():
-            return _empty_execution_result("aborted", len(self.cells))
-        msg_id = self.kc.execute(
+            return empty_result("aborted", len(self.cells))
+
+        message_id = self.client.execute(
             code, stop_on_error=False, store_history=True, allow_stdin=False
         )
-        self._unsettled_msg_id = msg_id
+        self._unfinished_message = message_id
         self.execution_count += 1
         count = self.execution_count
 
-        started = time.monotonic()
-        acquire_deadline = started + ACQUIRE_TIMEOUT_S
-        deadline = (
-            (started + timeout_ms / 1000.0) if timeout_ms and timeout_ms > 0 else None
+        started_at = time.monotonic()
+        acquire_deadline = started_at + ACQUIRE_TIMEOUT
+        execution_deadline = (
+            started_at + timeout_ms / 1000 if timeout_ms and timeout_ms > 0 else None
         )
-        busy_seen = False
-        interrupt_requested_at: float | None = None
+        became_busy = False
+        interrupted_at: float | None = None
         status = "ok"
-        stdout = stderr = result = ""
-        trunc = {"stdout": False, "stderr": False, "result": False}
+        capture = OutputCapture(max_output_chars)
         error = None
-        outputs: list[dict] = []
-        notebook_chars = 0
-        notebook_truncated = False
-
-        def record_output(output: dict) -> None:
-            nonlocal notebook_chars, notebook_truncated
-            size = len(json.dumps(output, ensure_ascii=False))
-            if max_output_chars <= 0 or notebook_chars + size <= max_output_chars:
-                outputs.append(output)
-                notebook_chars += size
-            elif not notebook_truncated:
-                outputs.append(
-                    {
-                        "output_type": "stream",
-                        "name": "stderr",
-                        "text": ["[notebook output truncated]\n"],
-                    }
-                )
-                notebook_truncated = True
 
         while True:
             now = time.monotonic()
-            if deadline is not None and now > deadline and busy_seen:
+            if (
+                execution_deadline is not None
+                and now > execution_deadline
+                and became_busy
+            ):
                 self._interrupt_requested.set()
                 self._interrupt_kernel()
-                deadline = None
+                execution_deadline = None
+
             if self._interrupt_requested.is_set():
-                if interrupt_requested_at is None:
-                    interrupt_requested_at = now
-                    # An interrupt can race with request startup; send it again
-                    # now that the execute message is definitely in flight.
+                if interrupted_at is None:
+                    interrupted_at = now
+                    # The first interrupt may have raced with execute_request.
                     self._interrupt_kernel()
-                elif now - interrupt_requested_at > BUSY_AFTER_INTERRUPT_S:
+                elif now - interrupted_at > INTERRUPT_TIMEOUT:
                     raise KernelBusyError(
                         "the interrupted IPython cell did not stop; the kernel is stuck. "
                         "Wait and retry, or restart the kernel to start fresh"
                     )
-            if not busy_seen and now > acquire_deadline:
+
+            if not became_busy and now > acquire_deadline:
                 raise KernelBusyError(
-                    "the IPython kernel is still running a previous cell and ignored the interrupt; "
-                    "wait and retry, or restart the kernel to start fresh"
+                    "the IPython kernel is still running a previous cell and ignored "
+                    "the interrupt; wait and retry, or restart the kernel to start fresh"
                 )
 
             try:
-                msg = self.kc.get_iopub_msg(timeout=IOPUB_POLL_S)
+                message = self.client.get_iopub_msg(timeout=POLL_INTERVAL)
             except Empty:
-                if not self.km.is_alive():
+                if not self.manager.is_alive():
                     raise RuntimeError("IPython kernel exited during execution")
                 continue
-            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+            if not self._belongs_to(message, message_id):
                 continue
 
-            msg_type = msg.get("msg_type")
-            content = msg.get("content", {})
-            if msg_type == "status":
+            message_type = message.get("msg_type")
+            content = message.get("content", {})
+            if message_type == "status":
                 state = content.get("execution_state")
                 if state == "busy":
-                    busy_seen = True
+                    became_busy = True
                 elif state == "idle":
-                    self._unsettled_msg_id = None
+                    self._unfinished_message = None
                     break
-            elif msg_type == "stream":
-                name = content.get("name", "stdout")
-                text = content.get("text", "")
-                if name == "stderr":
-                    before = len(stderr)
-                    stderr, t = _cap(stderr, text, max_output_chars)
-                    accepted = stderr[before:]
-                    trunc["stderr"] = trunc["stderr"] or t
-                else:
-                    before = len(stdout)
-                    stdout, t = _cap(stdout, text, max_output_chars)
-                    accepted = stdout[before:]
-                    trunc["stdout"] = trunc["stdout"] or t
-                if accepted:
-                    record_output(
-                        {"output_type": "stream", "name": name, "text": [accepted]}
-                    )
-                    if emit is not None:
-                        emit({"event": "stream", "name": name, "text": accepted})
-            elif msg_type == "execute_result":
-                data = content.get("data", {})
-                text = data.get("text/plain", "")
-                before = len(result)
-                result, t = _cap(result, text, max_output_chars)
-                accepted = result[before:]
-                trunc["result"] = trunc["result"] or t
-                if accepted:
-                    record_output(
-                        {
-                            "output_type": "execute_result",
-                            "execution_count": count,
-                            "data": {"text/plain": [accepted]},
-                            "metadata": {},
-                        }
-                    )
-            elif msg_type == "display_data":
-                data = content.get("data", {})
-                accepted = ""
-                if "text/plain" in data:
-                    text = data["text/plain"]
-                    before = len(result)
-                    result, t = _cap(result, text, max_output_chars)
-                    accepted = result[before:]
-                    trunc["result"] = trunc["result"] or t
-                display_data = dict(data)
-                if "text/plain" in display_data:
-                    display_data["text/plain"] = accepted
-                record_output(
-                    {
-                        "output_type": "display_data",
-                        "data": display_data,
-                        "metadata": content.get("metadata", {}),
-                    }
+            elif message_type == "stream":
+                name = "stderr" if content.get("name") == "stderr" else "stdout"
+                accepted = capture.stream(name, content.get("text", ""))
+                if accepted and emit is not None:
+                    emit({"event": "stream", "name": name, "text": accepted})
+            elif message_type == "execute_result":
+                capture.execution_result(
+                    content.get("data", {}).get("text/plain", ""), count
                 )
-            elif msg_type == "error":
-                error = {
-                    "ename": content.get("ename", ""),
-                    "evalue": content.get("evalue", ""),
-                    "traceback": content.get("traceback", []),
-                }
+            elif message_type == "display_data":
+                capture.display(content.get("data", {}), content.get("metadata", {}))
+            elif message_type == "error":
+                error = capture.error(content)
                 status = "error"
-                record_output({"output_type": "error", **error})
 
-        duration_ms = int((time.monotonic() - started) * 1000)
         if self._interrupt_requested.is_set():
             status = "aborted"
         if record:
@@ -512,72 +485,64 @@ class KernelSession:
                     "cell_type": "code",
                     "execution_count": count,
                     "metadata": {},
-                    "outputs": outputs,
+                    "outputs": capture.notebook_outputs,
                     "source": code.splitlines(keepends=True),
                 }
             )
-        result_payload = {
+
+        result = {
             "status": status,
-            "stdout": stdout,
-            "stderr": stderr,
-            "result": result,
-            "truncated": trunc,
-            "duration_ms": duration_ms,
+            "stdout": capture.stdout,
+            "stderr": capture.stderr,
+            "result": capture.result,
+            "truncated": capture.truncated,
+            "duration_ms": int((time.monotonic() - started_at) * 1000),
             "cells": len(self.cells),
         }
         if error is not None:
-            result_payload["error"] = error
-        return result_payload
+            result["error"] = error
+        return result
 
     def _run_internal(self, code: str) -> dict:
-        """Run a synthetic host cell (bootstrap/snapshot/restore): never recorded
-        in the notebook, and errors raise instead of returning error payloads."""
-        res = self.execute(code, record=False)
-        if res["status"] == "error":
-            err = res.get("error", {})
+        result = self.execute(code, record=False)
+        if result["status"] == "error":
+            error = result.get("error", {})
             raise RuntimeError(
-                f"kernel cell failed: {err.get('ename', '')}: {err.get('evalue', '')}"
+                f"kernel cell failed: {error.get('ename', '')}: "
+                f"{error.get('evalue', '')}"
             )
-        return res
-
-    # -- state snapshot / restore -------------------------------------------
+        return result
 
     def snapshot(self, path: str) -> dict:
-        res = self._run_internal(build_snapshot_cell(path, DEFAULT_SNAPSHOT_MAX_BYTES))
-        return self._parse_marker(res, "snapshot")
+        result = self._run_internal(snapshot_cell(path, SNAPSHOT_LIMIT))
+        return self._marker_result(result, "snapshot")
 
     def restore(self, path: str) -> dict:
-        res = self._run_internal(build_restore_cell(path))
-        return self._parse_marker(res, "restore")
+        result = self._run_internal(restore_cell(path))
+        return self._marker_result(result, "restore")
 
     @staticmethod
-    def _parse_marker(res: dict, kind: str) -> dict:
-        for line in res.get("stdout", "").splitlines():
-            if line.startswith(RESULT_MARKER):
-                payload = json.loads(line[len(RESULT_MARKER) :])
-                if "error" in payload:
-                    raise RuntimeError(f"{kind} failed: {payload['error']}")
-                return payload
+    def _marker_result(result: dict, operation: str) -> dict:
+        for line in result.get("stdout", "").splitlines():
+            if not line.startswith(RESULT_MARKER):
+                continue
+            payload = json.loads(line.removeprefix(RESULT_MARKER))
+            if "error" in payload:
+                raise RuntimeError(f"{operation} failed: {payload['error']}")
+            return payload
         raise RuntimeError(
-            f"{kind} produced no result marker; cell status={res.get('status')}"
+            f"{operation} produced no result marker; cell status={result.get('status')}"
         )
 
-    # -- notebook export ------------------------------------------------------
-
     def export_ipynb(self, path: str) -> dict:
-        # The notebook v4 format is plain JSON. Write its small subset directly
-        # so a compatible kernel only needs Jupyter execution dependencies; in
-        # particular, Prime Agent's managed kernel intentionally lacks nbformat.
-        def to_output(output: dict) -> dict:
-            result = dict(output)
-            if result.get("output_type") == "stream":
-                result["text"] = "".join(result.get("text", []))
-            return result
+        def notebook_output(output: dict) -> dict:
+            output = dict(output)
+            if output.get("output_type") == "stream":
+                output["text"] = "".join(output.get("text", []))
+            return output
 
-        nb = {
+        notebook = {
             "nbformat": 4,
-            # Cell IDs became required in minor version 5. Version 4 keeps this
-            # intentionally small writer valid without inventing identifiers.
             "nbformat_minor": 4,
             "metadata": {
                 "kernelspec": {
@@ -592,9 +557,7 @@ class KernelSession:
                     "cell_type": "code",
                     "execution_count": cell.get("execution_count"),
                     "metadata": {},
-                    "outputs": [
-                        to_output(output) for output in cell.get("outputs", [])
-                    ],
+                    "outputs": [notebook_output(item) for item in cell["outputs"]],
                     "source": cell["source"],
                 }
                 for cell in self.cells
@@ -603,188 +566,194 @@ class KernelSession:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        tmp = path + ".tmp"
+        temporary = path + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(nb, fh, ensure_ascii=False, indent=1)
-                fh.write("\n")
-            os.replace(tmp, path)
+            with open(temporary, "w", encoding="utf-8") as file:
+                json.dump(notebook, file, ensure_ascii=False, indent=1)
+                file.write("\n")
+            os.replace(temporary, path)
         except Exception:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            with suppress(OSError):
+                os.remove(temporary)
             raise
         return {"path": path, "cells": len(self.cells)}
 
 
-# ---- stdio protocol -------------------------------------------------------
+@dataclass
+class Request:
+    id: int
+    method: str
+    params: dict
+    emit: Callable[[dict], None] | None = None
 
 
 class Sidecar:
     def __init__(self) -> None:
         self.session: KernelSession | None = None
-        self.kernel_queue: queue.Queue = queue.Queue()
-        self.worker = threading.Thread(
-            target=self._worker_loop, name="pi-ipython-kernel", daemon=True
-        )
+        self.requests: queue.Queue[Request | None] = queue.Queue()
         self._send_lock = threading.Lock()
         self._execution_lock = threading.Lock()
-        self._known_execution_ids: set[int] = set()
-        self._cancelled_execution_ids: set[int] = set()
-        self._running_execution_id: int | None = None
+        self._known_executions: set[int] = set()
+        self._cancelled_executions: set[int] = set()
+        self._running_execution: int | None = None
 
-    def send(self, obj: dict) -> None:
+    def send(self, message: dict) -> None:
         with self._send_lock:
-            sys.stdout.write(json.dumps(obj) + "\n")
-            sys.stdout.flush()
+            print(json.dumps(message), flush=True)
 
-    def respond(self, req_id, payload: dict) -> None:
-        self.send({"id": req_id, **payload})
+    def respond(self, request_id: int, **payload: object) -> None:
+        self.send({"id": request_id, **payload})
 
-    def _execute_request(self, req_id: int, params: dict, emit) -> dict:
+    def _execute(self, request: Request) -> dict:
         if self.session is None:
             raise UsageError("kernel not started")
         session = self.session
 
         with self._execution_lock:
-            cancelled = req_id in self._cancelled_execution_ids
-            self._cancelled_execution_ids.discard(req_id)
+            cancelled = request.id in self._cancelled_executions
+            self._cancelled_executions.discard(request.id)
             if not cancelled:
                 session.prepare_execute()
-                self._running_execution_id = req_id
+                self._running_execution = request.id
 
         if cancelled:
             with self._execution_lock:
-                self._known_execution_ids.discard(req_id)
-            return _empty_execution_result("aborted", len(session.cells))
+                self._known_executions.discard(request.id)
+            return empty_result("aborted", len(session.cells))
 
         try:
             return session.execute(
-                params.get("code", ""),
-                timeout_ms=params.get("timeout_ms", 0) or 0,
-                max_output_chars=params.get(
-                    "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS
+                request.params.get("code", ""),
+                timeout_ms=request.params.get("timeout_ms", 0) or 0,
+                max_output_chars=request.params.get(
+                    "max_output_chars", DEFAULT_OUTPUT_LIMIT
                 )
-                or DEFAULT_MAX_OUTPUT_CHARS,
-                record=params.get("record", True),
-                emit=emit,
+                or DEFAULT_OUTPUT_LIMIT,
+                record=request.params.get("record", True),
+                emit=request.emit,
                 prepared=True,
             )
         finally:
             with self._execution_lock:
-                if self._running_execution_id == req_id:
-                    self._running_execution_id = None
-                self._known_execution_ids.discard(req_id)
+                if self._running_execution == request.id:
+                    self._running_execution = None
+                self._known_executions.discard(request.id)
 
-    def _worker_loop(self) -> None:
+    def _run_request(self, request: Request) -> dict:
+        method = request.method
+        if method == "start":
+            if self.session is not None:
+                self.session.shutdown()
+            self.session = KernelSession(request.params.get("cwd") or os.getcwd())
+            self.session.start()
+            return {"started": True}
+
+        if self.session is None:
+            raise UsageError("kernel not started")
+        if method == "execute":
+            return self._execute(request)
+        if method == "snapshot":
+            return self.session.snapshot(request.params["path"])
+        if method == "restore":
+            return self.session.restore(request.params["path"])
+        if method == "export_ipynb":
+            return self.session.export_ipynb(request.params["path"])
+        if method == "restart":
+            return self.session.restart()
+        if method == "shutdown":
+            self.session.shutdown()
+            return {"ok": True}
+        raise UsageError(f"unknown kernel method {method!r}")
+
+    def _worker(self) -> None:
         while True:
-            item = self.kernel_queue.get()
-            if item is None:
-                if self.session is not None:
-                    self.session.shutdown()
-                return
-            req_id, method, params, emit = item
+            request = self.requests.get()
+            if request is None:
+                break
             try:
-                if method == "start":
-                    if self.session is not None:
-                        self.session.shutdown()
-                    self.session = KernelSession(params.get("cwd") or os.getcwd())
-                    self.session.start()
-                    result = {"started": True}
-                else:
-                    if self.session is None:
-                        raise UsageError("kernel not started")
-                    session = self.session
-                    if method == "execute":
-                        result = self._execute_request(req_id, params, emit)
-                    elif method == "snapshot":
-                        result = session.snapshot(params["path"])
-                    elif method == "restore":
-                        result = session.restore(params["path"])
-                    elif method == "export_ipynb":
-                        result = session.export_ipynb(params["path"])
-                    elif method == "restart":
-                        result = session.restart()
-                    elif method == "shutdown":
-                        session.shutdown()
-                        result = {"ok": True}
-                    else:
-                        raise UsageError(f"unknown kernel method {method!r}")
-                self.respond(req_id, {"ok": True, "result": result})
-            except KernelBusyError as err:
+                result = self._run_request(request)
+                self.respond(request.id, ok=True, result=result)
+            except KernelBusyError as error:
                 self.respond(
-                    req_id,
-                    {
-                        "ok": False,
-                        "error": {"code": "kernel_busy", "message": str(err)},
-                    },
+                    request.id,
+                    ok=False,
+                    error={"code": "kernel_busy", "message": str(error)},
                 )
-            except Exception as err:  # noqa: BLE001 - host-facing boundary
+            except Exception as error:
                 self.respond(
-                    req_id,
-                    {"ok": False, "error": {"code": "error", "message": str(err)}},
+                    request.id,
+                    ok=False,
+                    error={"code": "error", "message": str(error)},
                 )
-            if method == "shutdown":
-                # The main thread stays blocked on stdin readline, so the only
-                # way to actually terminate is to exit the process here. The
-                # response is already flushed by send().
-                os._exit(0)
+            if request.method == "shutdown":
+                return
 
-    def handle(self, req: dict) -> None:
-        req_id = req.get("id")
-        method = req.get("method")
-        params = req.get("params") or {}
+        if self.session is not None:
+            self.session.shutdown()
+
+    def _interrupt(self, request_id: int, params: dict) -> None:
+        target = params.get("request_id")
+        should_interrupt = target is None
+        with self._execution_lock:
+            if target is not None and target in self._known_executions:
+                if target == self._running_execution:
+                    should_interrupt = True
+                else:
+                    self._cancelled_executions.add(target)
+            elif target is not None:
+                should_interrupt = False
+
+        if self.session is None or not should_interrupt:
+            self.respond(request_id, ok=True, result={"interrupted": False})
+            return
+        try:
+            self.respond(request_id, ok=True, result=self.session.interrupt())
+        except Exception as error:
+            self.respond(
+                request_id,
+                ok=False,
+                error={"code": "error", "message": str(error)},
+            )
+
+    def handle(self, message: dict) -> None:
+        request_id = message.get("id")
+        method = message.get("method")
+        params = message.get("params") or {}
+
         if method == "ping":
-            self.respond(req_id, {"ok": True, "result": {"pong": True}})
+            self.respond(request_id, ok=True, result={"pong": True})
             return
         if method == "interrupt":
-            target = params.get("request_id")
-            should_interrupt = target is None
-            with self._execution_lock:
-                if target is not None and target in self._known_execution_ids:
-                    if target == self._running_execution_id:
-                        should_interrupt = True
-                    else:
-                        self._cancelled_execution_ids.add(target)
-                elif target is not None:
-                    should_interrupt = False
-            if self.session is None or not should_interrupt:
-                self.respond(req_id, {"ok": True, "result": {"interrupted": False}})
-                return
-            try:
-                self.respond(req_id, {"ok": True, "result": self.session.interrupt()})
-            except Exception as err:
-                self.respond(
-                    req_id,
-                    {"ok": False, "error": {"code": "error", "message": str(err)}},
-                )
+            self._interrupt(request_id, params)
             return
+
+        emit = None
         if method == "execute":
             with self._execution_lock:
-                self._known_execution_ids.add(req_id)
+                self._known_executions.add(request_id)
 
-            def emit(ev: dict) -> None:
-                self.send({"id": req_id, **ev})
+            def emit(event: dict) -> None:
+                self.send({"id": request_id, **event})
 
-        else:
-            emit = None
-        self.kernel_queue.put((req_id, method, params, emit))
+        self.requests.put(Request(request_id, method, params, emit))
 
-    def run(self) -> None:
-        self.worker.start()
+    def _read_stdin(self) -> None:
         for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                req = json.loads(line)
+                message = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            self.handle(req)
-        # stdin closed: shut down and exit.
-        self.kernel_queue.put(None)
-        self.worker.join(timeout=15)
+            self.handle(message)
+        self.requests.put(None)
+
+    def run(self) -> None:
+        # Reading happens on a daemon thread so a clean shutdown does not need
+        # to force the process out while that thread is blocked in readline().
+        reader = threading.Thread(
+            target=self._read_stdin, name="sidecar-stdin", daemon=True
+        )
+        reader.start()
+        self._worker()
 
 
 def main() -> None:

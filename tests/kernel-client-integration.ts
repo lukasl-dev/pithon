@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PiIPythonClient } from "../kernel-client.ts";
+import { IPythonClient } from "../kernel-client.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const python = process.env.PI_IPYTHON_PYTHON ?? "python3";
@@ -15,7 +15,7 @@ const notebook = join(cwd, "notebook.ipynb");
 const finalSnapshot = join(cwd, "final-state.dill");
 const finalNotebook = join(cwd, "final-notebook.ipynb");
 
-const client = new PiIPythonClient(python, sidecar, cwd);
+const client = new IPythonClient(python, sidecar, cwd);
 let finalized = false;
 
 try {

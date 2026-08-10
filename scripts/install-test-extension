@@ -6,7 +6,7 @@ set -euo pipefail
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 target_dir="$HOME/.pi/agent/extensions/pi-ipython"
-runtime_files=(index.ts kernel-client.ts sidecar.py config.ts settings.ts README.md)
+runtime_files=(index.ts kernel-client.ts kernel-runtime.ts sidecar.py config.ts settings.ts README.md)
 
 for file in "${runtime_files[@]}"; do
   test -f "$source_dir/$file"

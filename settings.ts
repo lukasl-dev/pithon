@@ -61,8 +61,8 @@ const OUTPUT_LIMITS = new Map([
 ]);
 
 function outputLimitLabel(value: number): string {
-  for (const [label, bytes] of OUTPUT_LIMITS) {
-    if (bytes === value) return label;
+  for (const [label, characters] of OUTPUT_LIMITS) {
+    if (characters === value) return label;
   }
   return "64 KiB";
 }

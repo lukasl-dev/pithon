@@ -4,16 +4,10 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import {
-  KernelBusyError,
-  PiIPythonClient,
-  resolveKernelPython,
-  resolveSidecarPath,
-} from "./kernel-client.ts";
+import { KernelBusyError, type KernelExecuteResult } from "./kernel-client.ts";
+import { KernelRuntime } from "./kernel-runtime.ts";
 import {
   applyEnvironmentOverrides,
   type IPythonConfig,
@@ -22,10 +16,6 @@ import {
 } from "./config.ts";
 import { openIPythonSettings } from "./settings.ts";
 
-const SNAPSHOT_DEBOUNCE_MS = 1500;
-const FINALIZE_TIMEOUT_MS = 8000;
-
-/** Pi's native file/shell tools; tools from other extensions stay untouched. */
 const BUILTIN_TOOL_NAMES = new Set([
   "read",
   "bash",
@@ -66,26 +56,6 @@ The ipython tool runs a persistent IPython kernel for this directory. Its state 
 - It is fine to keep using read/edit/ffgrep/bash for quick single-file operations; prefer ipython when state or iteration matters.
 `;
 
-type KernelState = {
-  client?: PiIPythonClient;
-  clientStart?: Promise<PiIPythonClient>;
-  cwd?: string;
-  stateDir?: string;
-  snapshotPath?: string;
-  notebookPath?: string;
-  restoreDone: boolean;
-  snapshotTimer?: ReturnType<typeof setTimeout>;
-  snapshotInFlight: boolean;
-  snapshotDirty: boolean;
-};
-
-const state: KernelState = {
-  restoreDone: false,
-  snapshotInFlight: false,
-  snapshotDirty: false,
-};
-let config = applyEnvironmentOverrides(readIPythonConfig());
-
 function syncToolSelection(pi: ExtensionAPI, next: IPythonConfig): void {
   const available = new Set(pi.getAllTools().map(({ name }) => name));
   const active = new Set(pi.getActiveTools());
@@ -101,119 +71,12 @@ function syncToolSelection(pi: ExtensionAPI, next: IPythonConfig): void {
   pi.setActiveTools([...active]);
 }
 
-function resetState(): void {
-  if (state.snapshotTimer) clearTimeout(state.snapshotTimer);
-  state.client = undefined;
-  state.clientStart = undefined;
-  state.cwd = undefined;
-  state.stateDir = undefined;
-  state.snapshotPath = undefined;
-  state.notebookPath = undefined;
-  state.restoreDone = false;
-  state.snapshotInFlight = false;
-  state.snapshotDirty = false;
-}
-
-async function ensureClient(
-  ctx: ExtensionContext,
-  onProgress: (message: string) => void,
-): Promise<PiIPythonClient> {
-  if (state.client?.isRunning) return state.client;
-  if (state.clientStart) return state.clientStart;
-  state.client?.kill();
-  state.client = undefined;
-
-  const starting = (async () => {
-    const python = await resolveKernelPython(onProgress);
-    const client = new PiIPythonClient(
-      python,
-      resolveSidecarPath(),
-      state.cwd ?? ctx.cwd,
-    );
-    await client.start(onProgress);
-    state.client = client;
-    return client;
-  })();
-  state.clientStart = starting;
-  try {
-    return await starting;
-  } finally {
-    if (state.clientStart === starting) state.clientStart = undefined;
-  }
-}
-
-/** Debounced dill snapshot after each settled user cell. */
-function scheduleSnapshot(): void {
-  if (!config.snapshotState) return;
-  state.snapshotDirty = true;
-  if (!state.client || !state.snapshotPath || state.snapshotInFlight) return;
-  if (state.snapshotTimer) clearTimeout(state.snapshotTimer);
-  state.snapshotTimer = setTimeout(flushSnapshot, SNAPSHOT_DEBOUNCE_MS);
-}
-
-function flushSnapshot(): void {
-  state.snapshotTimer = undefined;
-  const client = state.client;
-  const path = state.snapshotPath;
-  if (!client || !path || state.snapshotInFlight || !state.snapshotDirty)
-    return;
-
-  state.snapshotDirty = false;
-  state.snapshotInFlight = true;
-  void client
-    .snapshot(path)
-    .catch(() => {
-      // Best effort; the next settled cell schedules another snapshot.
-    })
-    .finally(() => {
-      state.snapshotInFlight = false;
-      if (state.snapshotDirty && state.client === client) {
-        state.snapshotTimer = setTimeout(flushSnapshot, 0);
-      }
-    });
-}
-
 function appendOutput(current: string, next: string): string {
   if (!next) return current;
   if (!current || current.endsWith("\n") || next.startsWith("\n")) {
     return current + next;
   }
   return `${current}\n${next}`;
-}
-
-/** Revive the previous session's namespace in this directory, once per session. */
-async function maybeRestore(
-  ctx: ExtensionContext,
-): Promise<string | undefined> {
-  if (!config.restoreState) {
-    state.restoreDone = true;
-    return undefined;
-  }
-  if (state.restoreDone || !state.client || !state.snapshotPath)
-    return undefined;
-  state.restoreDone = true;
-  if (!existsSync(state.snapshotPath)) return undefined;
-  try {
-    const res = await state.client.restore(state.snapshotPath);
-    const lines = ["<ipython_state_restored>"];
-    if (res.restored.length > 0) {
-      lines.push(
-        `Restored ${res.restored.length} variable(s) from the previous session in this directory: ${res.restored.join(", ")}.`,
-      );
-    }
-    if (res.failed.length > 0) {
-      lines.push(
-        `Failed to restore: ${res.failed.map((f) => `${f.name} (${f.reason})`).join("; ")}.`,
-      );
-    }
-    if (res.restored.length === 0 && res.failed.length === 0) {
-      lines.push("The previous session's kernel state was empty.");
-    }
-    lines.push("</ipython_state_restored>");
-    return lines.join("\n");
-  } catch {
-    return undefined;
-  }
 }
 
 function chooseBusyAction(
@@ -227,6 +90,9 @@ function chooseBusyAction(
 }
 
 export default function (pi: ExtensionAPI) {
+  let config = applyEnvironmentOverrides(readIPythonConfig());
+  const runtime = new KernelRuntime(() => config);
+
   function saveAndApplyConfig(
     ctx: ExtensionContext,
     next: IPythonConfig,
@@ -238,59 +104,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     config = applyEnvironmentOverrides(next);
-    if (!config.snapshotState) {
-      if (state.snapshotTimer) clearTimeout(state.snapshotTimer);
-      state.snapshotTimer = undefined;
-      state.snapshotDirty = false;
-    }
+    runtime.configurationChanged();
     syncToolSelection(pi, config);
     return config;
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     config = applyEnvironmentOverrides(readIPythonConfig());
-    resetState();
-    state.cwd = ctx.cwd;
-    const sessionDir = ctx.sessionManager.getSessionDir();
-    state.stateDir = join(sessionDir, "pi-ipython");
-    mkdirSync(state.stateDir, { recursive: true });
-    state.snapshotPath = join(state.stateDir, "kernel-state.dill");
-    state.notebookPath = join(state.stateDir, "kernel-notebook.ipynb");
-
+    runtime.beginSession(ctx);
     syncToolSelection(pi, config);
   });
 
-  pi.on("session_shutdown", async () => {
-    if (state.snapshotTimer) {
-      clearTimeout(state.snapshotTimer);
-      state.snapshotTimer = undefined;
-    }
-    state.snapshotDirty = false;
-    const client = state.client;
-    state.client = undefined;
-    if (!client) return;
-    const work = client.finalize(
-      config.snapshotState ? state.snapshotPath : undefined,
-      config.exportNotebook ? state.notebookPath : undefined,
-    );
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        work,
-        new Promise<void>((resolve) => {
-          timeout = setTimeout(() => {
-            client.kill();
-            resolve();
-          }, FINALIZE_TIMEOUT_MS);
-        }),
-      ]);
-    } catch {
-      // Never let shutdown cleanup crash the session teardown.
-      client.kill();
-    } finally {
-      if (timeout) clearTimeout(timeout);
-    }
-  });
+  pi.on("session_shutdown", () => runtime.close());
 
   pi.registerTool({
     name: "ipython",
@@ -350,13 +175,7 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!config.enabled) throw new Error("pi-ipython is disabled");
-      const working = (message?: string) => {
-        try {
-          ctx.ui.setWorkingMessage(message);
-        } catch {
-          // cosmetic; stale UI context
-        }
-      };
+      const working = (message?: string) => ctx.ui.setWorkingMessage(message);
       const report = (text: string) =>
         onUpdate?.({
           content: [{ type: "text", text }],
@@ -365,15 +184,15 @@ export default function (pi: ExtensionAPI) {
 
       working("Starting IPython kernel...");
       try {
-        const client = await ensureClient(ctx, (message) => {
+        const client = await runtime.getClient(ctx, (message) => {
           working(message);
           report(message);
         });
 
-        const restoreNotice = await maybeRestore(ctx);
+        const restoreNotice = await runtime.restorePreviousState();
 
         let kernelRestarted = false;
-        let result: Awaited<ReturnType<PiIPythonClient["execute"]>>;
+        let result: KernelExecuteResult;
         for (;;) {
           try {
             result = await client.execute(params.code, {
@@ -417,7 +236,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        scheduleSnapshot();
+        runtime.cellSettled();
 
         let text = "";
         if (restoreNotice) text += `${restoreNotice}\n\n`;
@@ -458,7 +277,7 @@ export default function (pi: ExtensionAPI) {
     if (status === "error" || status === "aborted") return { isError: true };
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", (event) => {
     if (!config.enabled) return;
     return { systemPrompt: event.systemPrompt + IPYTHON_DOCTRINE };
   });
@@ -477,28 +296,35 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("kernel", {
     description: "IPython kernel: status, export notebook, restart",
     handler: async (args, ctx) => {
-      const [verb = "status"] = (args ?? "").trim().split(/\s+/);
+      const [verb = "status", ...rest] = args
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
       try {
         if (verb === "status") {
-          if (!state.client?.isRunning) {
+          if (!runtime.isRunning) {
             ctx.ui.notify("IPython kernel not started yet.", "info");
             return;
           }
-          const lines = [
-            `cwd: ${state.cwd ?? "?"}`,
-            `state dir: ${state.stateDir ?? "?"}`,
-            `snapshot: ${state.snapshotPath ?? "?"}${existsSync(state.snapshotPath ?? "") ? "" : " (none yet)"}`,
-            `notebook: ${state.notebookPath ?? "?"}`,
-          ];
-          ctx.ui.notify(`IPython kernel running.\n${lines.join("\n")}`, "info");
+          ctx.ui.notify(
+            `IPython kernel running.\n${runtime.statusLines().join("\n")}`,
+            "info",
+          );
           return;
         }
-        const client = await ensureClient(ctx, (message) =>
+        if (verb !== "export" && verb !== "restart") {
+          ctx.ui.notify(
+            `Unknown /kernel verb: ${verb} (status|export|restart)`,
+            "warning",
+          );
+          return;
+        }
+
+        const client = await runtime.getClient(ctx, (message) =>
           ctx.ui.notify(message, "info"),
         );
         if (verb === "export") {
-          const target =
-            args.split(/\s+/).slice(1).join(" ").trim() || state.notebookPath;
+          const target = rest.join(" ") || runtime.defaultNotebookPath;
           if (!target) {
             ctx.ui.notify("No notebook path (session dir missing).", "error");
             return;
@@ -509,17 +335,13 @@ export default function (pi: ExtensionAPI) {
         }
         if (verb === "restart") {
           await client.restart();
-          state.restoreDone = true;
+          runtime.markRestarted();
           ctx.ui.notify(
             "IPython kernel restarted (in-memory state lost).",
             "info",
           );
           return;
         }
-        ctx.ui.notify(
-          `Unknown /kernel verb: ${verb} (status|export|restart)`,
-          "warning",
-        );
       } catch (error) {
         ctx.ui.notify(`IPython kernel error: ${String(error)}`, "error");
       }
