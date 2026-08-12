@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { IPythonClient } from "../kernel-client.ts";
+import { IPythonClient, resolveSidecarPath } from "../kernel-client.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const python = process.env.PI_IPYTHON_PYTHON ?? "python3";
@@ -14,6 +14,10 @@ const snapshot = join(cwd, "state.dill");
 const notebook = join(cwd, "notebook.ipynb");
 const finalSnapshot = join(cwd, "final-state.dill");
 const finalNotebook = join(cwd, "final-notebook.ipynb");
+
+if (resolveSidecarPath() !== sidecar) {
+  throw new Error("sidecar.py was not resolved relative to kernel-client.ts");
+}
 
 const client = new IPythonClient(python, sidecar, cwd);
 let finalized = false;

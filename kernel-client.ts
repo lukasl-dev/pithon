@@ -6,6 +6,8 @@ import { createInterface, type Interface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+declare const __dirname: string | undefined;
+
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_OUTPUT_LIMIT = 64 * 1024;
@@ -80,6 +82,7 @@ function moduleDirectory(): string | undefined {
   } catch {
     // jiti may compile this module as CommonJS.
   }
+  if (typeof __dirname === "string") return __dirname;
   return undefined;
 }
 
@@ -100,7 +103,7 @@ export function resolveSidecarPath(): string {
   }
 
   throw new Error(
-    "pi-ipython: cannot find sidecar.py. Set PI_IPYTHON_SIDECAR or install the extension as ~/.pi/agent/extensions/pi-ipython/.",
+    "pi-ipython: cannot find sidecar.py beside the extension. Set PI_IPYTHON_SIDECAR to its path.",
   );
 }
 
