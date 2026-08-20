@@ -12,6 +12,7 @@ let
     python.ipykernel
     python.jupyter-client
     python.nest-asyncio
+    python.pillow
   ]);
 in
 stdenvNoCC.mkDerivation {
