@@ -8,11 +8,20 @@
 
 let
   kernelPython = python3.withPackages (python: [
+    python.beautifulsoup4
     python.dill
     python.ipykernel
     python.jupyter-client
+    python.lxml
+    python.matplotlib
     python.nest-asyncio
+    python.numpy
+    python.pandas
     python.pillow
+    python.polars
+    python.scipy
+    python.seaborn
+    python.sympy
   ]);
 in
 stdenvNoCC.mkDerivation {
